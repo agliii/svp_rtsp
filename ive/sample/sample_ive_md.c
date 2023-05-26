@@ -41,6 +41,62 @@
 #define OT_SAMPLE_IVE_SAD_THRESHOLD 100
 #define OVERLAYEX_MIN_HANDLE 20
 #include "rtsp_demo.h"
+#include "acl.h"
+
+int SMALL_PIC_WIDTH = 416;
+int SMALL_PIC_HEIGHT = 416;
+#define NPU_SHOW_TOP_NUM 5
+#define PATH_MAX 255
+#define MAX_INPUT_NUM 5
+#define MAX_OUTPUT_NUM 5
+
+#define NPU_SHOW_TOP_NUM 5
+
+const static char *yolov3Label[] = {"person", "bicycle", "car", "motorbike",
+                                    "aeroplane", "bus", "train", "truck", "boat",
+                                    "traffic light", "fire hydrant", "stop sign", "parking meter",
+                                    "bench", "bird", "cat", "dog", "horse",
+                                    "sheep", "cow", "elephant", "bear", "zebra",
+                                    "giraffe", "backpack", "umbrella", "handbag", "tie",
+                                    "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+                                    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+                                    "tennis racket", "bottle", "wine glass", "cup",
+                                    "fork", "knife", "spoon", "bowl", "banana",
+                                    "apple", "sandwich", "orange", "broccoli", "carrot",
+                                    "hot dog", "pizza", "donut", "cake", "chair",
+                                    "sofa", "potted plant", "bed", "dining table", "toilet",
+                                    "TV monitor", "laptop", "mouse", "remote", "keyboard",
+                                    "cell phone", "microwave", "oven", "toaster", "sink",
+                                    "refrigerator", "book", "clock", "vase", "scissors",
+                                    "teddy bear", "hair drier", "toothbrush"};
+
+enum BBoxIndex
+{
+    TOPLEFTX = 0,
+    TOPLEFTY,
+    BOTTOMRIGHTX,
+    BOTTOMRIGHTY,
+    SCORE,
+    LABEL
+};
+
+typedef struct npu_acl_model
+{
+    td_u32 model_id;
+    td_ulong model_mem_size;
+    td_ulong model_weight_size;
+    td_void *model_mem_ptr;
+    td_void *model_weight_ptr;
+    td_phys_addr_t model_mem_phy_addr;
+    td_phys_addr_t model_weight_phy_addr;
+    td_bool is_load_flag;
+    aclmdlDesc *model_desc;
+    aclmdlDataset *input_dataset;
+    aclmdlDataset *output_dataset;
+    td_phys_addr_t output_phy_addr[MAX_OUTPUT_NUM];
+    td_phys_addr_t input_phy_addr[MAX_INPUT_NUM];
+} npu_acl_model_t;
+
 typedef struct
 {
     ot_svp_src_img img[OT_SAMPLE_IVE_MD_IMAGE_NUM];
@@ -84,7 +140,286 @@ static int EXIT_MODE_X = 1;
 static int End_Rtsp = 1;
 rtsp_handle_struct rtsp_handle[2];
 atomic_uint random_int;
-char  platename[]=" 京沪津渝冀晋蒙辽吉黑苏浙皖闽赣鲁豫鄂湘粤桂琼川贵云藏陕甘青宁新学警港澳挂使领民航危险品黄白黑绿未单双0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+char platename[] = " 京沪津渝冀晋蒙辽吉黑苏浙皖闽赣鲁豫鄂湘粤桂琼川贵云藏陕甘青宁新学警港澳挂使领民航危险品黄白黑绿未单双0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+#if 1
+static npu_acl_model_t npu_acl_model = {0};
+const char *acl_config_path = "";
+td_u32 npu_dev_id = 0;
+aclrtRunMode run_mode;
+const char *om_model_path = "./yolov3_framework_caffe_aipp_1_batch_1_input_int8_output_FP32.om.om";
+td_char path[PATH_MAX] = {0};
+td_u32 output_size;
+td_u32 buffer_size;
+td_u32 input_size;
+
+td_void *input_buffer = TD_NULL;
+td_void *input_buffer2 = TD_NULL;
+td_void *output_buffer = TD_NULL;
+
+aclDataBuffer *input_data = TD_NULL;
+aclDataBuffer *input_data2 = TD_NULL;
+aclDataBuffer *output_data = TD_NULL;
+aclDataBuffer *output_buffer_0 = TD_NULL;
+aclDataBuffer *output_buffer_1 = TD_NULL;
+td_void *data = TD_NULL;
+td_u32 len;
+td_float top[NPU_SHOW_TOP_NUM] = {0.0};
+ot_video_frame_info frame_info_x;
+#endif
+
+void acl_init()
+{
+    int ret;
+    ret = aclInit(acl_config_path);
+    if (ret != ACL_ERROR_NONE)
+    {
+        sample_print("acl init fail.\n");
+        return TD_FAILURE;
+    }
+    sample_print("acl init success.\n");
+
+    /* open device */
+    ret = aclrtSetDevice(npu_dev_id);
+    if (ret != ACL_ERROR_NONE)
+    {
+        sample_print("acl open device %d fail.\n", npu_dev_id);
+        return TD_FAILURE;
+    }
+    sample_print("open device %d success.\n", npu_dev_id);
+
+    /* get run mode */
+    ret = aclrtGetRunMode(&run_mode);
+    if ((ret != ACL_ERROR_NONE) || (run_mode != ACL_DEVICE))
+    {
+        sample_print("acl get run mode fail.\n");
+        return TD_FAILURE;
+    }
+    sample_print("get run mode success\n");
+
+    if (realpath(om_model_path, path) == TD_NULL)
+    {
+        sample_print("invalid file!.\n");
+        return TD_NULL;
+    }
+
+    ret = aclmdlQuerySize(path, &npu_acl_model.model_mem_size, &npu_acl_model.model_weight_size);
+    if (ret != ACL_ERROR_NONE)
+    {
+        sample_print("query model failed, model file is %s\n", path);
+        return TD_FAILURE;
+    }
+    printf("mem_size=%lu weight_size=%lu\n", npu_acl_model.model_mem_size, npu_acl_model.model_weight_size);
+
+    ret = aclrtMalloc(&npu_acl_model.model_mem_ptr, npu_acl_model.model_mem_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_ERROR_NONE)
+    {
+        sample_print("malloc buffer for mem failed, require size is %lu\n", npu_acl_model.model_mem_size);
+        return TD_FAILURE;
+    }
+
+    ret = aclrtMalloc(&npu_acl_model.model_weight_ptr, npu_acl_model.model_weight_size, ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_ERROR_NONE)
+    {
+        sample_print("malloc buffer for weight fail, require size is %lu\n", npu_acl_model.model_weight_size);
+        return TD_FAILURE;
+    }
+
+    ret = aclmdlLoadFromFileWithMem(path, &npu_acl_model.model_id, npu_acl_model.model_mem_ptr, npu_acl_model.model_mem_size,
+                                    npu_acl_model.model_weight_ptr, npu_acl_model.model_weight_size);
+    if (ret != ACL_ERROR_NONE)
+    {
+        sample_print("load model from file failed, model file is %s\n", path);
+        return TD_FAILURE;
+    }
+
+    npu_acl_model.is_load_flag = TD_TRUE;
+    printf("Load model success!\n");
+
+    npu_acl_model.model_desc = aclmdlCreateDesc();
+    if (npu_acl_model.model_desc == TD_NULL)
+    {
+        sample_print("create model description failed\n");
+        return TD_FAILURE;
+    }
+
+    ret = aclmdlGetDesc(npu_acl_model.model_desc, npu_acl_model.model_id);
+    if (ret != ACL_ERROR_NONE)
+    {
+        sample_print("get model description failed\n");
+        return TD_FAILURE;
+    }
+    sample_print("create model description success\n");
+    ///////////////////////////////////////////////////
+    ///////////////////////////////////////////////////
+}
+    
+void *ai_processing()
+{
+    int i, ret;
+    while(1)
+    {
+        npu_acl_model.input_dataset = aclmdlCreateDataset();
+        if (npu_acl_model.input_dataset == TD_NULL)
+        {
+            sample_print("can't create dataset, create input failed\n");
+            return TD_FAILURE;
+        }
+
+        npu_acl_model.output_dataset = aclmdlCreateDataset();
+        if (npu_acl_model.output_dataset == TD_NULL)
+        {
+            sample_print("can't create dataset, create output failed\n");
+            return TD_FAILURE;
+        }
+
+        output_size = aclmdlGetNumOutputs(npu_acl_model.model_desc);
+        for (i = 0; i < output_size; ++i)
+        {
+            buffer_size = aclmdlGetOutputSizeByIndex(npu_acl_model.model_desc, i);
+            printf("output %d size = %d\n", i, buffer_size);
+
+            ret = aclrtMalloc(&output_buffer, buffer_size, ACL_MEM_MALLOC_NORMAL_ONLY);
+            if (ret != ACL_ERROR_NONE)
+            {
+                sample_print("can't malloc buffer, size is %u, create output failed\n", buffer_size);
+                return TD_FAILURE;
+            }
+            printf("%s:%d\n", __func__, __LINE__);
+            output_data = aclCreateDataBuffer(output_buffer, buffer_size);
+            if (output_data == TD_NULL)
+            {
+                sample_print("can't create data buffer, create output failed\n");
+                aclrtFree(output_buffer);
+                return TD_FAILURE;
+            }
+            printf("%s:%d\n", __func__, __LINE__);
+            ret = aclmdlAddDatasetBuffer(npu_acl_model.output_dataset, output_data);
+            if (ret != ACL_ERROR_NONE)
+            {
+                sample_print("can't add data buffer, create output failed\n");
+                aclrtFree(output_buffer);
+                aclDestroyDataBuffer(output_data);
+                return TD_FAILURE;
+            }
+        }
+        printf("%s:%d\n", __func__, __LINE__);
+        input_size = aclmdlGetInputSizeByIndex(npu_acl_model.model_desc, 0);
+        printf("input_size=%lu\n", input_size);
+        printf("%s:%d\n", __func__, __LINE__);
+        ret = aclrtMalloc(&input_buffer, input_size, ACL_MEM_MALLOC_NORMAL_ONLY);
+        if (ret != ACL_ERROR_NONE)
+        {
+            sample_print("malloc device buffer fail. size is %zu, errorCode is %d.\n", input_size, ret);
+            return TD_FAILURE;
+        }
+        // add input2
+        printf("%s:%d\n", __func__, __LINE__);
+
+        float imageInfo[4] = {(float)416, (float)416, (float)416, (float)416};
+
+// fill_input_data
+#if 1
+        char *addr0 = ss_mpi_sys_mmap(frame_info_x.video_frame.phys_addr[0], SMALL_PIC_WIDTH * SMALL_PIC_HEIGHT);
+        char *addr1 = ss_mpi_sys_mmap(frame_info_x.video_frame.phys_addr[1], SMALL_PIC_WIDTH * SMALL_PIC_HEIGHT / 2);
+
+        memcpy_s((char *)input_buffer, SMALL_PIC_WIDTH * SMALL_PIC_HEIGHT, addr0, SMALL_PIC_WIDTH * SMALL_PIC_HEIGHT);
+        memcpy_s((char *)(input_buffer + SMALL_PIC_WIDTH * SMALL_PIC_HEIGHT), SMALL_PIC_WIDTH * SMALL_PIC_HEIGHT / 2, addr1, SMALL_PIC_WIDTH * SMALL_PIC_HEIGHT / 2);
+
+        ss_mpi_sys_munmap(addr0, SMALL_PIC_WIDTH * SMALL_PIC_HEIGHT);
+        ss_mpi_sys_munmap(addr1, SMALL_PIC_WIDTH * SMALL_PIC_HEIGHT / 2);
+#endif
+
+        printf("0x%02x 0x%02x 0x%02x 0x%02x\n", *(char *)(input_buffer), *(char *)(input_buffer + 1), *(char *)(input_buffer + 2), *(char *)(input_buffer + 3));
+
+        input_data = aclCreateDataBuffer(input_buffer, input_size);
+        if (input_data == TD_NULL)
+        {
+            sample_print("can't create data buffer, create input failed\n");
+            return TD_FAILURE;
+        }
+
+        ret = aclmdlAddDatasetBuffer(npu_acl_model.input_dataset, input_data);
+        if (ret != ACL_SUCCESS)
+        {
+            sample_print("add input dataset buffer failed, ret is %d\n", ret);
+            (void)aclDestroyDataBuffer(input_data);
+            input_data = TD_NULL;
+            return TD_FAILURE;
+        }
+        // add input2
+        input_data2 = aclCreateDataBuffer(imageInfo, sizeof(imageInfo));
+        if (input_data2 == TD_NULL)
+        {
+            sample_print("can't create data buffer, create input failed\n");
+            return TD_FAILURE;
+        }
+    
+
+    ret = aclmdlAddDatasetBuffer(npu_acl_model.input_dataset, input_data2);
+    if (ret != ACL_SUCCESS)
+    {
+        sample_print("add input dataset buffer failed, ret is %d\n", ret);
+        (void)aclDestroyDataBuffer(input_data);
+        input_data = TD_NULL;
+        return TD_FAILURE;
+    }
+    // add input2
+    printf("%s:%d\n", __func__, __LINE__);
+    ret = aclmdlExecute(npu_acl_model.model_id, npu_acl_model.input_dataset, npu_acl_model.output_dataset);
+    sample_print("end aclmdlExecute, modelId is %u\n", npu_acl_model.model_id);
+    printf("%s:%d\n", __func__, __LINE__);
+    // output_model_result
+
+    output_buffer_0 = aclmdlGetDatasetBuffer(npu_acl_model.output_dataset, 0);
+    float *detectData = (float *)aclGetDataBufferAddr(output_buffer_0);
+
+    output_buffer_1 = aclmdlGetDatasetBuffer(npu_acl_model.output_dataset, 1);
+    uint32_t *boxNum = (uint32_t *)aclGetDataBufferAddr(output_buffer_1);
+
+    printf("%s:%d\n", __func__, __LINE__);
+    if (boxNum == TD_NULL)
+    {
+        printf("%s:%d\n", __func__, __LINE__);
+        return TD_FAILURE;
+    }
+    td_u32 totalBox = boxNum[0];
+    printf("%s:%d totalBox=%d \n", __func__, __LINE__, totalBox);
+    float widthScale = 1;
+    float heightScale = 1;
+    for (i = 0; i < totalBox; i++)
+    {
+        printf("%s:%d\n", __func__, __LINE__);
+        // get the confidence of the detected object. Anything less than 0.8 is considered invalid
+        td_u32 score = (td_u32)(detectData[totalBox * SCORE + i] * 100);
+        printf("%s:%d score=%d \n", __func__, __LINE__, score);
+        if (score < 80)
+            continue;
+        // get the frame coordinates and converts them to the coordinates on the original frame
+        printf("[%f %f %f %f]\n",
+               detectData[totalBox * TOPLEFTX + i],
+               detectData[totalBox * TOPLEFTY + i],
+               detectData[totalBox * BOTTOMRIGHTX + i],
+               detectData[totalBox * BOTTOMRIGHTY + i]);
+        printf("%s:%d\n", __func__, __LINE__);
+        // Construct a string that marks the object: object name + confidence
+        td_u32 objIndex = (td_u32)detectData[totalBox * LABEL + i];
+        printf("%s \n", yolov3Label[objIndex]);
+        printf("%s:%d\n", __func__, __LINE__);
+    }
+
+    printf("Release buffer\n");
+
+    aclDestroyDataBuffer(input_data);
+    aclDestroyDataBuffer(output_data);
+    aclrtFree(input_buffer);
+    aclrtFree(output_buffer);
+    aclmdlDestroyDataset(npu_acl_model.output_dataset);
+    aclmdlDestroyDataset(npu_acl_model.input_dataset);
+    aclmdlDestroyDesc(npu_acl_model.model_desc);
+    aclrtFree(npu_acl_model.model_mem_ptr);
+    aclrtFree(npu_acl_model.model_weight_ptr);
+    }
+}
 
 static td_void sample_ivs_md_uninit(ot_sample_ivs_md_info *md_info_ptr)
 {
@@ -310,7 +645,6 @@ ot_sample_svp_rect_info region_tmp;
 ot_sample_svp_rect_info region_tmp_old;
 int bmp_w, bmp_h;
 
-
 static int get_stream_from_one_channl(int s_LivevencChn, rtsp_demo_handle g_rtsplive,
                                       rtsp_session_handle session)
 {
@@ -425,10 +759,9 @@ td_void *VENC_GetVencStreamProc(td_void *p)
         random_int = 1;
     }
     free(p);
-  
+
     return NULL;
 }
-
 
 int string_to_bmp(char *pu8Str)
 {
@@ -485,39 +818,36 @@ int string_to_bmp(char *pu8Str)
     return 0;
 }
 
-/* 
+/*
  *描述  ：用于osd 字体bmp图像生成
  *参数  ：NULL
  *返回值：无
  *注意  ：需要加载字体ttf才能使用，否则会报段错误
  */
-void *bitmap_update(void )
+void *bitmap_update(void)
 {
     ot_rgn_handle OverlayHandle = 0;
     td_s32 s32Ret;
     // time_t now;
     // struct tm *ptm;
     // char timestr[OSD_LENGTH] = {0};
-    while(1)
+    while (1)
     {
         sleep(1);
-        if(p->labelN[0]==0)
+        if (p->labelN[0] == 0)
             continue;
         ss_mpi_rgn_update_canvas(OVERLAYEX_MIN_HANDLE);
-        s32Ret = ss_mpi_rgn_set_bmp(OVERLAYEX_MIN_HANDLE,&stBitmap);//s32Ret 为RGN_HANDLE OverlayHandle
-        if(s32Ret != TD_SUCCESS)
+        s32Ret = ss_mpi_rgn_set_bmp(OVERLAYEX_MIN_HANDLE, &stBitmap); // s32Ret 为RGN_HANDLE OverlayHandle
+        if (s32Ret != TD_SUCCESS)
         {
             printf("HI_MPI_RGN_SetBitMap update failed with %#x!\n", s32Ret);
             return -1;
         }
-       
-       memset(stBitmap.data, 0, (2 * (bmp_w) * (bmp_h)));
-       
-       
+
+        memset(stBitmap.data, 0, (2 * (bmp_w) * (bmp_h)));
     }
     return 0;
 }
-
 
 void *osd_ttf_task(void)
 {
@@ -526,7 +856,7 @@ void *osd_ttf_task(void)
     time_t now;
     struct tm *ptm;
     char timestr[720] = {0};
-    int i,j;
+    int i, j;
     char b[3];
     stBitmap.data = malloc(2 * 3840 * 66);
     if (stBitmap.data == NULL)
@@ -544,29 +874,29 @@ void *osd_ttf_task(void)
         // {
         //     ;
         // }
-        if(p->labelN[0]==0)
+        if (p->labelN[0] == 0)
         {
             timestr[0] = ' ';
         }
         else
         {
-            for(i = 0;i < p->labelN[0];i++)
+            for (i = 0; i < p->labelN[0]; i++)
             {
-                for(j=1;j<=15;j++)
+                for (j = 1; j <= 15; j++)
                 {
-                    if(p->labelN[(i*15)+j] < 151 && p->labelN[(i*15)+j] != 0)
+                    if (p->labelN[(i * 15) + j] < 151 && p->labelN[(i * 15) + j] != 0)
                     {
-                        b[0] = platename[p->labelN[(i*15)+j]];
-                        b[1] = platename[p->labelN[(i*15)+j]+1];
-                        b[2] = platename[p->labelN[(i*15)+j]+2];
+                        b[0] = platename[p->labelN[(i * 15) + j]];
+                        b[1] = platename[p->labelN[(i * 15) + j] + 1];
+                        b[2] = platename[p->labelN[(i * 15) + j] + 2];
                     }
                     else
                     {
-                        b[0] = platename[p->labelN[(i*15)+j]];
+                        b[0] = platename[p->labelN[(i * 15) + j]];
                     }
-                    strcat(timestr,b);
-                    memset(b,0,3);
-                }    
+                    strcat(timestr, b);
+                    memset(b, 0, 3);
+                }
             }
             //  printf("===========timestr================%s\n",timestr);
         }
@@ -608,7 +938,7 @@ td_s32 RGN_AddOsdToVenc(void)
     /**创建区域**/
     sleep(2); // 等待位图生成
     stRgnAttr.attr.overlay.canvas_num = 2;
-    stRgnAttr.type = OT_RGN_OVERLAYEX;                                                /**区域类型:叠加**/
+    stRgnAttr.type = OT_RGN_OVERLAYEX;                                              /**区域类型:叠加**/
     stRgnAttr.attr.overlay.pixel_format = OT_PIXEL_FORMAT_ARGB_1555; /**像素格式**/ // PIXEL_FORMAT_BGR_565 PIXEL_FORMAT_ARGB_1555
     if (stBitmap.width % 2 != 0)
     {
@@ -620,24 +950,25 @@ td_s32 RGN_AddOsdToVenc(void)
         stBitmap.height += 1;
     }
     printf("stBitmap.width is %d ,stBitmap.height is %d\n", stBitmap.width, stBitmap.height);
-    stRgnAttr.attr.overlay.size.width = 3840;   // 240;        /**区域宽**/
-    stRgnAttr.attr.overlay.size.height = 66; // 192;        /**区域高**/
-    stRgnAttr.attr.overlay.bg_color = 0xffff;         // 0x00007c00; /**区域背景颜色**/
+    stRgnAttr.attr.overlay.size.width = 3840; // 240;        /**区域宽**/
+    stRgnAttr.attr.overlay.size.height = 66;  // 192;        /**区域高**/
+    stRgnAttr.attr.overlay.bg_color = 0xffff; // 0x00007c00; /**区域背景颜色**/
 
-    for (i = OVERLAYEX_MIN_HANDLE; i < OVERLAYEX_MIN_HANDLE + handle_num; i++) {
+    for (i = OVERLAYEX_MIN_HANDLE; i < OVERLAYEX_MIN_HANDLE + handle_num; i++)
+    {
         ret = ss_mpi_rgn_create(i, &stRgnAttr);
-        if (ret != TD_SUCCESS) {
+        if (ret != TD_SUCCESS)
+        {
             sample_print("ss_mpi_rgn_create failed with %#x!\n", ret);
             return TD_FAILURE;
         }
     }
-    
 
     // s32Ret = ss_mpi_rgn_create(OverlayHandle, &stRgnAttr);
     // if (s32Ret != TD_SUCCESS)
     // {
     //     printf("RGN create failed: %#x\n", s32Ret);
-	// return -1;
+    // return -1;
     // }
     /**将区域叠加到通道**/
     /**设置叠加区域的通道显示属性**/
@@ -645,7 +976,7 @@ td_s32 RGN_AddOsdToVenc(void)
     stChnAttr.type = OT_RGN_OVERLAYEX;
     // stChnAttr.attr.overlay_chn.point.x = 640; // 240;
     // stChnAttr.attr.overlay_chn.point.y = 320; // 192;
-    stChnAttr.attr.overlay_chn.point.x = 0; // 240;
+    stChnAttr.attr.overlay_chn.point.x = 0;   // 240;
     stChnAttr.attr.overlay_chn.point.y = 320; // 192;
     stChnAttr.attr.overlay_chn.bg_alpha = 0;
     stChnAttr.attr.overlay_chn.fg_alpha = 128;
@@ -673,10 +1004,12 @@ td_s32 RGN_AddOsdToVenc(void)
 #endif
     stChnAttr.attr.overlay_chn.dst = OT_RGN_ATTACH_JPEG_MAIN;
     // OverlayHandle = 0;
-    for (i = OVERLAYEX_MIN_HANDLE; i < OVERLAYEX_MIN_HANDLE + handle_num; i++) {
+    for (i = OVERLAYEX_MIN_HANDLE; i < OVERLAYEX_MIN_HANDLE + handle_num; i++)
+    {
         // sample_region_get_overlayex_chn_attr(i, &chn_attr->attr.overlayex_chn);
         ret = sample_region_attach_to_chn(i, &stChn, &stChnAttr);
-        if (ret != TD_SUCCESS) {
+        if (ret != TD_SUCCESS)
+        {
             sample_print("sample_region_attach_to_chn failed!\n");
             sample_comm_region_detach_frm_chn(i - OVERLAYEX_MIN_HANDLE + 1, OT_RGN_OVERLAYEX, &stChn);
             return ret;
@@ -687,19 +1020,20 @@ td_s32 RGN_AddOsdToVenc(void)
     // if (s32Ret != TD_SUCCESS)
     // {
     //     printf("HI_MPI_RGN_AttachToChn: %#x\n", s32Ret);
-	// return -1;
+    // return -1;
     // }
     stBitmap.pixel_format = OT_PIXEL_FORMAT_ARGB_1555;
     // stBitmap.height = OVERLAY_H;
     // stBitmap.width = OVERLAY_W;
 
-for (i = OVERLAYEX_MIN_HANDLE; i < OVERLAYEX_MIN_HANDLE + handle_num; i++) {
-    s32Ret = ss_mpi_rgn_set_bmp(i, &stBitmap);
-}
+    for (i = OVERLAYEX_MIN_HANDLE; i < OVERLAYEX_MIN_HANDLE + handle_num; i++)
+    {
+        s32Ret = ss_mpi_rgn_set_bmp(i, &stBitmap);
+    }
     if (s32Ret != TD_SUCCESS)
     {
         printf("HI_MPI_RGN_SetBitMap failed with %#x!\n", s32Ret);
-	return -1;
+        return -1;
     }
     // memset(stBitmap.data, 0, (2 * (622) * (56)));
     // s32Ret = HI_MPI_RGN_GetCanvasInfo(OverlayHandle,&stCanvasInfo);
@@ -716,7 +1050,6 @@ for (i = OVERLAYEX_MIN_HANDLE; i < OVERLAYEX_MIN_HANDLE + handle_num; i++) {
     // }
     return 0;
 }
-
 
 unsigned char *user_addr;
 
@@ -738,7 +1071,7 @@ void *udp_recv_thread()
     char ptr_recv[512] = {0};
     int recv_num = 0;
     int i, j;
-    
+
     while (1)
     {
         //  socklen_t len = sizeof(serverAddr);
@@ -746,18 +1079,18 @@ void *udp_recv_thread()
         //		printf("recv begin\n");
         recv_num = recvfrom(sockfd, ptr_recv, sizeof(ptr_recv), 0, (struct sockaddr *)&caddr, &clen);
         //	recv(sockfd,ptr_recv,256,0);
-        	
+
         // memcpy(p, ptr_recv, 256);
         //		printf("recv num = %d\n", recv_num);
         //		printf("recv = %d, %d, %d\n", ptr_recv[0], ptr_recv[3], ptr_recv[4]);
         //		printf("p[0] = %d\n", p[0]);
         p = (Total_result *)ptr_recv;
-        
+
         // printf("===========================================\n");
         // printf("====arr 0 = %d\n", p->arr[0]);
         // printf("===========================================\n");
         region_tmp_old.num = p->arr[0] > 10 ? 10 : p->arr[0];
-        
+
         if (region_tmp_old.num != 0)
         {
             //	printf("test num is %d\n",region_tmp.num);
@@ -776,7 +1109,6 @@ void *udp_recv_thread()
             }
         }
     }
-    
 }
 
 void start_udp_server()
@@ -809,9 +1141,7 @@ static td_void *sample_ivs_md_proc(td_void *args)
     td_s32 vpss_chn[] = {OT_VPSS_CHN0, OT_VPSS_CHN1};
     td_s32 cur_idx = 0;
     td_bool is_first_frm = TD_TRUE;
-    atomic_init(&random_int, 1);
-    
-
+    acl_init();
     sample_svp_check_exps_return(md_ptr == TD_NULL, TD_NULL, SAMPLE_SVP_ERR_LEVEL_ERROR, "md_inf_ptr can't be null\n");
 
     /* Create chn */
@@ -819,18 +1149,18 @@ static td_void *sample_ivs_md_proc(td_void *args)
     sample_svp_check_exps_return(ret != TD_SUCCESS, TD_NULL, SAMPLE_SVP_ERR_LEVEL_ERROR, "ot_ivs_md_create_chn fail\n");
     // udp server
 
-    start_udp_server();
+    // start_udp_server();
 
     // udpserver end
     //
     //
-    pthread_t osd_task ;
+    pthread_t osd_task;
     pthread_create(&osd_task, NULL, osd_ttf_task, NULL);
     pthread_detach(osd_task);
     RGN_AddOsdToVenc();
-    pthread_t bitmap_update_t ;
+    pthread_t bitmap_update_t;
     pthread_create(&bitmap_update_t, NULL, bitmap_update, NULL);
-    pthread_detach(bitmap_update_t);    
+    pthread_detach(bitmap_update_t);
     int count;
     size = 12441600;
     ptr_tx = malloc(size);
@@ -838,9 +1168,10 @@ static td_void *sample_ivs_md_proc(td_void *args)
     // ptr_rx = malloc(512);
     shmid_tx = shmget(100, size, IPC_CREAT | 0664);
     ptr_tx = shmat(shmid_tx, NULL, 0);
+    int i;
     // shmid_rx = shmget(111, 256, IPC_CREAT|0664);
     // ptr_rx = shmat(shmid_rx, NULL, 0);
-
+    
     while (g_stop_signal == TD_FALSE)
     {
         ret = ss_mpi_vpss_get_chn_frame(hld.vpss_grp, vpss_chn[1], &frm[1], OT_SAMPLE_IVE_MD_MILLIC_SEC);
@@ -873,10 +1204,160 @@ static td_void *sample_ivs_md_proc(td_void *args)
         // if(strlen(ptr_tx) == 0) {
         if (count % 5 == 0)
         {
-            user_addr = (unsigned char *)ss_mpi_sys_mmap(frm[0].video_frame.phys_addr[0], size);
-            memcpy(ptr_tx, user_addr, size);
-            ss_mpi_sys_munmap(user_addr, size);
+            // user_addr = (unsigned char *)ss_mpi_sys_mmap(frm[0].video_frame.phys_addr[0], size);
+            // memcpy(ptr_tx, user_addr, size);
+            // ss_mpi_sys_munmap(user_addr, size);
+            npu_acl_model.input_dataset = aclmdlCreateDataset();
+    if (npu_acl_model.input_dataset == TD_NULL) {
+        sample_print("can't create dataset, create input failed\n");
+        return TD_FAILURE;
+    }
+
+    npu_acl_model.output_dataset = aclmdlCreateDataset();
+    if (npu_acl_model.output_dataset == TD_NULL) {
+        sample_print("can't create dataset, create output failed\n");
+        return TD_FAILURE;
+    }
+
+    output_size = aclmdlGetNumOutputs(npu_acl_model.model_desc);
+    for (int i = 0; i < output_size; ++i) {
+        buffer_size = aclmdlGetOutputSizeByIndex(npu_acl_model.model_desc, i);
+        // printf("output %d size = %d\n",i,buffer_size);
+
+        ret = aclrtMalloc(&output_buffer, buffer_size, ACL_MEM_MALLOC_NORMAL_ONLY);
+        if (ret != ACL_ERROR_NONE) {
+            sample_print("can't malloc buffer, size is %u, create output failed\n", buffer_size);
+            return TD_FAILURE;
         }
+// printf("%s:%d\n",__func__,__LINE__);
+        output_data = aclCreateDataBuffer(output_buffer, buffer_size);
+        if (output_data == TD_NULL) {
+            sample_print("can't create data buffer, create output failed\n");
+            aclrtFree(output_buffer);
+            return TD_FAILURE;
+        }
+// printf("%s:%d\n",__func__,__LINE__);
+        ret = aclmdlAddDatasetBuffer(npu_acl_model.output_dataset, output_data);
+        if (ret != ACL_ERROR_NONE) {
+            sample_print("can't add data buffer, create output failed\n");
+            aclrtFree(output_buffer);
+            aclDestroyDataBuffer(output_data);
+            return TD_FAILURE;
+        }
+    }
+// printf("%s:%d\n",__func__,__LINE__);
+    input_size = aclmdlGetInputSizeByIndex(npu_acl_model.model_desc, 0);
+// printf("input_size=%lu\n",input_size);
+// printf("%s:%d\n",__func__,__LINE__);
+
+    //add input2
+    float imageInfo[4] = {(float)416, (float)416, (float)416, (float)416};
+
+// printf("%s:%d\n",__func__,__LINE__);
+//         printf("input_size=%lu\n",input_size);
+        //aclrtFree(input_buffer);
+    ret = aclrtMalloc(&input_buffer, input_size, ACL_MEM_MALLOC_NORMAL_ONLY);
+    if (ret != ACL_ERROR_NONE) {
+        sample_print("malloc device buffer fail. size is %zu, errorCode is %d.\n", input_size, ret);
+        return TD_FAILURE;
+    }
+  char *addr0 = ss_mpi_sys_mmap(frm[0].video_frame.phys_addr[0], SMALL_PIC_WIDTH*SMALL_PIC_HEIGHT);
+    char *addr1 = ss_mpi_sys_mmap(frm[0].video_frame.phys_addr[1], SMALL_PIC_WIDTH*SMALL_PIC_HEIGHT/2);
+
+    memcpy_s((char *)input_buffer,SMALL_PIC_WIDTH*SMALL_PIC_HEIGHT,addr0,SMALL_PIC_WIDTH*SMALL_PIC_HEIGHT);
+    memcpy_s((char *)(input_buffer+SMALL_PIC_WIDTH*SMALL_PIC_HEIGHT),SMALL_PIC_WIDTH*SMALL_PIC_HEIGHT/2,addr1,SMALL_PIC_WIDTH*SMALL_PIC_HEIGHT/2);
+
+//  printf("input memcpy_s initail\n");
+
+    ss_mpi_sys_munmap(addr0, SMALL_PIC_WIDTH*SMALL_PIC_HEIGHT);
+    ss_mpi_sys_munmap(addr1, SMALL_PIC_WIDTH*SMALL_PIC_HEIGHT/2);
+    // printf("input_buffer_size=%lu\n",sizeof(input_buffer));
+
+
+
+    // printf("0x%02x 0x%02x 0x%02x 0x%02x\n",*(char *)(input_buffer),*(char *)(input_buffer+1),*(char *)(input_buffer+2),*(char *)(input_buffer+3));
+// printf("input_size=%lu\n",input_size);
+    input_data = aclCreateDataBuffer(input_buffer, input_size);
+    if (input_data == TD_NULL) {
+        sample_print("can't create data buffer, create input failed\n");
+        return TD_FAILURE;
+    }
+//  printf("input aclCreateDataBuffer initail\n");
+    ret = aclmdlAddDatasetBuffer(npu_acl_model.input_dataset, input_data);
+    if (ret != ACL_SUCCESS) {
+        sample_print("add input dataset buffer failed, ret is %d\n", ret);
+        (void)aclDestroyDataBuffer(input_data);
+        input_data = TD_NULL;
+        return TD_FAILURE;
+    }
+//  printf("input aclmdlAddDatasetBuffer initail\n");
+ //add input2
+    input_data2 = aclCreateDataBuffer(imageInfo, sizeof(imageInfo));
+    if (input_data2 == TD_NULL) {
+        sample_print("can't create data buffer, create input failed\n");
+        return TD_FAILURE;
+    }
+//  printf("input aclCreateDataBuffer initail\n");
+    ret = aclmdlAddDatasetBuffer(npu_acl_model.input_dataset, input_data2);
+    if (ret != ACL_SUCCESS) {
+        sample_print("add input dataset buffer failed, ret is %d\n", ret);
+        (void)aclDestroyDataBuffer(input_data);
+        input_data = TD_NULL;
+        return TD_FAILURE;
+    }
+    //add input2
+//  printf("input aclCreateDataBuffer initail\n");
+// printf("%s:%d\n",__func__,__LINE__);
+    ret = aclmdlExecute(npu_acl_model.model_id, npu_acl_model.input_dataset,npu_acl_model.output_dataset);
+    sample_print("end aclmdlExecute, modelId is %u\n", npu_acl_model.model_id);
+// printf("%s:%d\n",__func__,__LINE__);
+    //output_model_result
+
+    output_buffer_0 = aclmdlGetDatasetBuffer(npu_acl_model.output_dataset, 0);
+    float* detectData = (float *)aclGetDataBufferAddr(output_buffer_0);
+
+    output_buffer_1 = aclmdlGetDatasetBuffer(npu_acl_model.output_dataset, 1);
+    uint32_t* boxNum = (uint32_t*)aclGetDataBufferAddr(output_buffer_1);
+
+// printf("%s:%d\n",__func__,__LINE__);
+    if (boxNum == TD_NULL) {
+     printf("%s:%d\n",__func__,__LINE__);
+        return TD_FAILURE;
+    }
+    td_u32 totalBox = boxNum[0];
+printf("%s:%d totalBox=%d \n",__func__,__LINE__,totalBox);
+    float widthScale = 1;
+    float heightScale = 1;
+for (i = 0; i < totalBox; i++) {
+        printf("%s:%d\n",__func__,__LINE__);
+        //get the confidence of the detected object. Anything less than 0.8 is considered invalid
+        td_u32 score = (td_u32)(detectData[totalBox * SCORE + i] * 100);
+    printf("%s:%d score=%d \n",__func__,__LINE__,score);
+        if (score < 80) continue;
+        //get the frame coordinates and converts them to the coordinates on the original frame
+        printf("[%f %f %f %f]\n",\
+            detectData[totalBox * TOPLEFTX + i],\
+            detectData[totalBox * TOPLEFTY + i],\
+            detectData[totalBox * BOTTOMRIGHTX + i],\
+            detectData[totalBox * BOTTOMRIGHTY + i]);
+printf("%s:%d\n",__func__,__LINE__);
+        //Construct a string that marks the object: object name + confidence
+        td_u32 objIndex = (td_u32)detectData[totalBox * LABEL + i];
+        printf("%s \n",yolov3Label[objIndex]);
+printf("%s:%d\n",__func__,__LINE__);
+    }
+
+    //aclDestroyDataBuffer(input_data);
+    //aclDestroyDataBuffer(output_data);
+    //free(input_buffer) ;
+    //input_buffer= NULL;
+    aclrtFree(input_buffer);
+    //input_buffer = TD_NULL;
+    aclrtFree(output_buffer);
+
+        }
+
+        
 
         // if(strlen(ptr_rx) != 0) {
         //	if(1) {
@@ -902,10 +1383,10 @@ static td_void *sample_ivs_md_proc(td_void *args)
             region_tmp = region_tmp_old;
         }
 
-        // if(random_int == 1) {
-        ret = sample_common_svp_vgs_fill_rect_changecolor(&frm[0], &region_tmp, boxcolor);
-        sample_svp_check_failed_err_level_goto(ret, base_free, "sample_svp_vgs_fill_rect fail,Err(%#x)\n", ret); 
         
+        ret = sample_common_svp_vgs_fill_rect_changecolor(&frm[0], &region_tmp, boxcolor);
+        sample_svp_check_failed_err_level_goto(ret, base_free, "sample_svp_vgs_fill_rect fail,Err(%#x)\n", ret);
+
         ret = ss_mpi_venc_send_frame(hld.vo_chn, &frm[0], OT_SAMPLE_IVE_MD_MILLIC_SEC);
         sample_svp_check_failed_err_level_goto(ret, base_free, "ss_mpi_venc_send_frame fail,Error(%#x)\n", ret);
         random_int = 0;
@@ -973,8 +1454,9 @@ td_void sample_ive_md(td_void)
     ot_size pic_size;
     ot_pic_size pic_type = PIC_1080P;
     td_s32 ret;
-    p= malloc(sizeof(Total_result));
+    p = malloc(sizeof(Total_result));
     (td_void) memset_s(&g_md_info, sizeof(g_md_info), 0, sizeof(g_md_info));
+    
     /*
      * step 1: start vi vpss venc vo
      */
@@ -1003,10 +1485,13 @@ td_void sample_ive_md(td_void)
     // system("cd /root/YOLOV3_rtsp_opencv_ffmpeg/out && ./main");
 
     //    ret = sample_ive_md_pause();
+    
     rtsp_handle[0].g_rtsplive = create_rtsp_demo(554);
     rtsp_handle[0].session = create_rtsp_session(rtsp_handle[0].g_rtsplive, "/live.264", 0);
     rtsp_handle[0].channel_num = 0;
     pthread_create(&VencPid1, 0, VENC_GetVencStreamProc, NULL);
+    // pthread_t ai_proc;
+    // pthread_create(&ai_proc, 0, ai_processing,NULL);
     while (1)
         ;
     sample_svp_check_exps_return_void(ret == TD_TRUE, SAMPLE_SVP_ERR_LEVEL_ERROR, "md exist!\n");
